@@ -523,7 +523,7 @@ interface ChannelRegistryOptions {
    * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
    * wins), BEFORE `defaultPublishChannel`.
    */
-  activeChannelResolver?: (agentName: string) => string | undefined;
+  activeChannelResolver?: (agentName: string) => string | null | undefined;
 }
 
 // ============================================================================
@@ -570,7 +570,7 @@ export class ChannelRegistry {
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
-  private activeChannelResolver?: (agentName: string) => string | undefined;
+  private activeChannelResolver?: (agentName: string) => string | null | undefined;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -1344,9 +1344,7 @@ export class ChannelRegistry {
     // item-3 redux), else the global default (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
-    const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
-    const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = agentName ? this.resolveLocus(agentName) : this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -2936,8 +2934,11 @@ export class ChannelRegistry {
   }
 
   resolveLocus(conversationId: string): string | null {
-    const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    const active = this.activeChannelResolver?.(conversationId);
+    // Explicit null means operator/archive delivery, not an external send.
+    // It must beat a fork home as well as the last inbound channel.
+    if (active === null) return null;
+    return this.homeChannelResolver?.(conversationId) ?? active ?? this.defaultPublishChannel ?? null;
   }
 
   async routeSpeech(
@@ -2949,7 +2950,7 @@ export class ChannelRegistry {
      *  dispatch resolving live can read the NEXT turn's trigger state or a
      *  stale global default and land the reply in the wrong channel (item-3,
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
-     *  "this turn is pinned to no locus": fail loudly rather than guess. */
+     *  "this turn is archive/operator-only": do not attempt an external send. */
     locusChannelId: string | null,
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
@@ -2979,7 +2980,7 @@ export class ChannelRegistry {
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
-      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
+      return null; // Archive/operator reply; no external delivery was requested.
     }
 
     const entry = this.findChannelEntry(channelId);
@@ -3035,7 +3036,12 @@ export class ChannelRegistry {
       channelId,
       content: [{ type: 'text', text }],
     };
-    const result = await server.sendChannelsPublish(publishParams);
+    let result: unknown;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+    } catch (error) {
+      return fail(channelId, `publish to "${channelId}" failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay

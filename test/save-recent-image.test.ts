@@ -203,12 +203,12 @@ async function waitForToolResult(
     await new Promise((r) => setTimeout(r, 50));
     const cm = framework.getAgent('prime')?.getContextManager();
     const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{
-      content: Array<{ type: string; toolUseId?: string; content?: unknown; isError?: boolean }>;
+      content: Array<{ type: string; toolUseId?: string; content?: unknown; imageHistory?: string; isError?: boolean }>;
     }>;
     for (const m of msgs) {
       for (const b of m.content ?? []) {
         if (b.type === 'tool_result' && b.toolUseId === callId) {
-          return { content: b.content as string, isError: b.isError === true };
+          return { content: typeof b.content === 'string' ? b.content : b.imageHistory!, isError: b.isError === true };
         }
       }
     }
@@ -248,7 +248,7 @@ describe('save_recent_image provenance (issue #104)', () => {
     try {
       const snap = await waitForToolResult(h.framework, 'call_snap');
       assert.match(snap.content, /\[image: image\/png, \d+B, ref img_[0-9a-z]+_1\]/, 'placeholder carries the ref');
-      assert.ok(!snap.content.includes(PNG.toString('base64')), 'history never holds the base64');
+      assert.ok(!snap.content.includes(PNG.toString('base64')), 'compact inventory must not encode the image as text');
 
       const first = saved(await waitForToolResult(h.framework, 'call_save0'));
       assert.strictEqual(first.length, 1);

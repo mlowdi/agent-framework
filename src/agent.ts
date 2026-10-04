@@ -1,5 +1,6 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { projectToolResultMedia } from './tool-result-media.js';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
@@ -647,26 +648,20 @@ export class Agent {
 
     // The direct Agent API uses the same admission rules as framework-driven
     // streams. Stage before compiling so compression only sees placeholders.
-    const guardedResults = this._state.status === 'ready' && this.toolResultGuard.enabled;
-    if (guardedResults && this._state.status === 'ready') {
+    const stagedResults = this._state.status === 'ready';
+    if (stagedResults && this._state.status === 'ready') {
       const content = this.buildToolResultMessages(this._state.toolResults)[0].content;
       const wireResults = content.flatMap((block) => block.type === 'tool_result'
-        // buildToolResultMessages serializes every payload to a string.
-        ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
+        ? [{ toolUseId: block.toolUseId, content: block.content, isError: block.isError }] : []);
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
     }
 
     // Compile context (with optional injections)
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
-    // If we have pending tool results, add them
-    if (this._state.status === 'ready' && !guardedResults) {
-      const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
-      messages.push(...toolResultMessages);
-    }
-
     const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages, true),
+      liveImagePolicy: this.contextManager.getLiveImagePolicy(),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -832,7 +827,7 @@ export class Agent {
         content: m.content.filter(
           // typeof guard is deliberate runtime defense: history loaded from
           // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+          (b: ContentBlock) => !(b.type === "text" && !b.rawItem && (typeof b.text !== "string" || b.text.trim() === "")),
         ),
       }))
       .filter((m) => m.content.length > 0);
@@ -849,6 +844,7 @@ export class Agent {
 
     return {
       messages: this.toolResultGuard.prepareRequest(messages),
+      liveImagePolicy: this.contextManager.getLiveImagePolicy(),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -1211,22 +1207,23 @@ export class Agent {
   }
 
   private buildToolResultMessages(results: CompletedToolCall[]): NormalizedMessage[] {
-    // Tool results go as a user message with tool_result blocks. The history
-    // serializer turns MCP image blocks into `[image: type, size]` so the
-    // persisted transcript stays small and survives truncation.
+    // Tool results stay typed in history, including nested/error media. CM
+    // archives their bytes separately and applies the live window on compile;
+    // text fallback/truncation must never convert encoded image bytes to prose.
     //
     // This is the direct-Agent-API path (the framework stores results itself
     // via buildStoredToolResultContent, with workspace spill). No workspace
     // is reachable from here, so the house default cap applies as plain
     // truncation — bounded beats unbounded, for errors too.
-    const content = results.map((r) => ({
-      type: 'tool_result' as const,
-      toolUseId: r.id,
-      content: r.result.isError
-        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
-      isError: r.result.isError,
-    }));
+    const content = results.map(r => {
+      const media = projectToolResultMedia(r.result.data)?.map(block => block.type === 'text'
+        ? { ...block, text: truncateForHistory(block.text, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS) } : block);
+      const error = r.result.isError
+        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS) : undefined;
+      return { type: 'tool_result' as const, toolUseId: r.id, isError: r.result.isError,
+        content: media ? (error ? [{ type: 'text' as const, text: error }, ...media] : media)
+          : error ?? toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS) };
+    });
 
     return [{
       participant: 'user',

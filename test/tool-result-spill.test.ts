@@ -157,12 +157,12 @@ async function waitForStoredToolResult(
     await new Promise((r) => setTimeout(r, 100));
     const cm = framework.getAgent('prime')?.getContextManager();
     const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{
-      content: Array<{ type: string; content?: unknown; isError?: boolean }>;
+      content: Array<{ type: string; content?: unknown; imageHistory?: string; isError?: boolean }>;
     }>;
     for (const m of msgs) {
       for (const b of m.content ?? []) {
         if (b.type === 'tool_result') {
-          return { content: b.content as string, isError: b.isError === true };
+          return { content: typeof b.content === 'string' ? b.content : b.imageHistory!, isError: b.isError === true };
         }
       }
     }
