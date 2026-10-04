@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { ContextManager, MessageId } from '@animalabs/context-manager';
-import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
+import { estimateImagePolicyContentTokens, type ContentBlock, type NormalizedMessage, type ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { isStateExistsError } from './module-registry.js';
 
@@ -66,17 +66,13 @@ export class ToolResultGuard {
   get pendingWireReserveTokens(): number {
     const pending = this.pending;
     if (!pending) return 0;
-    let chars = 0;
-    let images = 0;
+    let tokens = 0;
     for (const result of pending.wireResults) {
-      if (typeof result.content === 'string') chars += result.content.length;
-      else for (const block of result.content as ContentBlock[]) {
-        if (block.type === 'image') images += 1;
-        else chars += JSON.stringify(block).length;
-      }
-      chars -= TOOL_RESULT_GUARD_NOTICE.length;
+      tokens += typeof result.content === 'string' ? Math.ceil(result.content.length / 4)
+        : estimateImagePolicyContentTokens(result.content);
+      tokens -= Math.ceil(TOOL_RESULT_GUARD_NOTICE.length / 4);
     }
-    return Math.max(0, Math.ceil(chars / 4) + images * 1600);
+    return Math.max(0, tokens);
   }
 
   /** Ordered storage work, separate from batches awaiting a provider verdict.
@@ -145,7 +141,12 @@ export class ToolResultGuard {
   }
 
   storeResults(content: ContentBlock[], wireResults: ToolResult[], originals: CompletedToolCall[]): MessageId {
-    if (!this.enabled) return this.cm.addMessage('user', content);
+    if (!this.enabled) {
+      // The unguarded path needs the same audit originals: invalid image
+      // shapes and pre-spill output must survive projection and restart too.
+      this.append({ type: 'unguarded', originals: this.archive(originals) });
+      return this.cm.addMessage('user', content);
+    }
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that
       // retries after a failure between staging and submission (e.g. a

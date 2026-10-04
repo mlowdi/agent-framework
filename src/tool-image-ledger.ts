@@ -1,33 +1,22 @@
 /**
- * Per-agent retention of tool-result images, with provenance (issue #104).
+ * Per-agent tool-image retention with provenance (issue #104).
  *
- * History keeps a compact text placeholder for every image a tool returns —
- * the bytes only ever ride the live wire copy of that one turn. That policy
- * is right (megabytes of base64 in the persisted window would be sliced,
- * compressed, and replayed forever), but it left `save_recent_image` with no
- * way to reach an image the resident had just seen: the scanner walked past
- * the byteless placeholder and quietly saved whichever OLDER attachment came
- * next, under the filename the resident chose for the new one.
+ * Typed conversation content is archived by CM and filtered only in live
+ * projections. A separate compact imageHistory inventory carries these refs
+ * for save_recent_image; live-window filtering must not erase originals.
  *
- * This ledger is the missing half. At ingestion every tool-result image is
- * retained here under a stable per-agent ref (`img_k7x3q2_7`) bound to the
- * exact tool call and block it came from, with its digest. The ref carries a
- * per-ledger nonce: ledgers live and die with the process, but the persisted
- * store keeps yesterday's placeholders visible in context, so a bare sequence
- * number would let a stale `img_7` resolve to whatever this process minted
- * seventh. A stale ref must resolve `unknown`, never to other bytes.
- *
- * The history placeholder carries the ref, so the ordered inventory
- * `save_recent_image` walks can
- * include tool images at their true position — and when the bytes behind a
- * ref are gone (bounded eviction, or a restart: the ledger is in-memory by
- * design, so it never adds to blob growth), the save fails AT THAT INDEX with
- * a specific error instead of sliding to an older image. Silent substitution
- * of bytes from another surface is the failure this exists to end.
+ * A stable ref (`img_k7x3q2_7`) binds the exact tool call and projected block
+ * index to its digest. Its nonce prevents a process restart from assigning an
+ * old ref to new bytes. With a store/stateId, originals and provenance survive
+ * cache eviction and restart; without one, the bounded process cache retains
+ * the original in-memory-only behavior. Missing bytes fail at that inventory
+ * slot, never silently substitute an older image from another surface.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
 import { safeSlice } from './safe-slice.js';
+import type { JsStore } from '@animalabs/chronicle';
+import { isStateExistsError } from './module-registry.js';
 
 export interface RetainedToolImage {
   /** Stable per-ledger handle (`img_<nonce>_<seq>`), minted once per (toolCallId, blockIndex). */
@@ -56,6 +45,9 @@ export type ToolImageLookup =
   | { status: 'unknown' };
 
 export interface ToolImageLedgerOptions {
+  /** Durable originals, independent of the bounded process cache. */
+  store?: JsStore;
+  stateId?: string;
   /** Total base64 chars held across retained images (≈ bytes × 4/3). */
   maxChars?: number;
   /** Maximum number of images whose bytes are held. */
@@ -80,9 +72,13 @@ export class ToolImageLedger {
   private readonly maxChars: number;
   private readonly maxEntries: number;
 
-  constructor(options: ToolImageLedgerOptions = {}) {
+  constructor(private readonly options: ToolImageLedgerOptions = {}) {
     this.maxChars = options.maxChars ?? DEFAULT_TOOL_IMAGE_LEDGER_MAX_CHARS;
     this.maxEntries = options.maxEntries ?? DEFAULT_TOOL_IMAGE_LEDGER_MAX_ENTRIES;
+    if (options.store && options.stateId) {
+      try { options.store.registerState({ id: options.stateId, strategy: 'append_log' }); }
+      catch (error) { if (!isStateExistsError(error)) throw error; }
+    }
   }
 
   /**
@@ -128,6 +124,12 @@ export class ToolImageLedger {
       data: source.data,
     };
     const { data: _data, ...provenance } = image;
+    if (this.options.store && this.options.stateId) {
+      // Store the exact encoded source without a full binary decode/copy.
+      // Digesting remains chunked; loading is only on explicit ref access.
+      const blobId = this.options.store.storeBlob(Buffer.from(source.data, 'ascii'), 'text/plain');
+      this.options.store.appendToStateJson(this.options.stateId, { ...provenance, blobId });
+    }
     this.refByKey.set(key, ref);
     this.issued.set(ref, provenance);
     // A single image over the whole budget is issued (so the placeholder is
@@ -145,6 +147,18 @@ export class ToolImageLedger {
     const held = this.retained.get(ref);
     if (held) return { status: 'retained', image: held };
     const known = this.issued.get(ref);
+    if (this.options.store && this.options.stateId) {
+      const records = this.options.store.getStateJson(this.options.stateId) as Array<RetainedToolImage & { blobId: string }> | null;
+      const archived = records?.find(record => record.ref === ref);
+      if (archived) {
+        const bytes = this.options.store.getBlob(archived.blobId);
+        if (bytes) {
+          const { blobId: _blobId, ...provenance } = archived;
+          return { status: 'retained', image: { ...provenance, data: bytes.toString('ascii') } };
+        }
+        return { status: 'evicted', image: archived };
+      }
+    }
     if (known) return { status: 'evicted', image: known };
     return { status: 'unknown' };
   }

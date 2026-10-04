@@ -15,7 +15,7 @@ type RouteFailure = { conversationId: string; channelId: string | null; reason: 
 function makeRegistry(
   publishResult: { delivered?: boolean } | undefined,
   homeChannelResolver?: (agentName: string) => string | undefined,
-  activeChannelResolver?: (agentName: string) => string | undefined,
+  activeChannelResolver?: (agentName: string) => string | null | undefined,
   onChannelAutoOpened?: (info: {
     conversationId?: string;
     serverId: string;
@@ -30,12 +30,14 @@ function makeRegistry(
   const openCalls: Array<{ channelId?: string }> = [];
   const closeCalls: Array<{ channelId?: string }> = [];
   let failOpens = false;
+  let publishFailure: Error | undefined;
 
   const mockServer = {
     // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
       publishCalls.push(params);
+      if (publishFailure) throw publishFailure;
       return publishResult;
     },
     sendChannelsOpen: async (params: { channelId?: string }) => {
@@ -75,6 +77,7 @@ function makeRegistry(
   return {
     registry, failures, traces, publishCalls, openCalls, closeCalls, lookup,
     setFailOpens: (v: boolean) => { failOpens = v; },
+    setPublishFailure: (error: Error) => { publishFailure = error; },
   };
 }
 
@@ -198,14 +201,38 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
   assert.equal(trunkCtx?.defaultOutgoing?.channelId, 'chanB');
 });
 
-test('routeSpeech surfaces a failure when there is no locus at all', async () => {
-  const { registry, failures } = makeRegistry({ delivered: true });
-  // No handleIncoming → defaultPublishChannel is null.
-  const res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
-  assert.equal(res, null);
+test('a no-locus reply stays on archive/operator surfaces without a false channel failure', async () => {
+  const { registry, failures, traces, publishCalls } = makeRegistry({ delivered: true });
+  const res = await registry.routeSpeech('cairn', 'operator reply', registry.resolveLocus('cairn'));
+  assert.equal(res, null, 'no external delivery receipt is invented');
+  assert.equal(failures.length, 0);
+  assert.equal(publishCalls.length, 0);
+  assert.ok(!traces.some(trace => trace.type === 'mcpl:speech-route-failed' || trace.type === 'mcpl:speech-routed'));
+});
+
+test('an operator-only pin beats both a fork home and a stale global channel', async () => {
+  const { registry, failures, publishCalls } = makeRegistry({ delivered: true }, () => 'home', () => null);
+  seedRegistered(registry, 'discord', 'stale');
+  registry.handleIncoming('discord', incoming('stale', 'previous Discord turn'));
+  assert.equal(registry.resolveLocus('operator-agent'), null);
+  assert.equal(await registry.routeSpeech('operator-agent', 'archive-visible reply', registry.resolveLocus('operator-agent')), null);
+  assert.equal(publishCalls.length, 0);
+  assert.equal(failures.length, 0);
+});
+
+test('a selected-channel publish exception retains its exact destination and failure cause', async () => {
+  const { registry, failures, traces, publishCalls, setPublishFailure } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'selected');
+  registry.handleIncoming('discord', incoming('selected', 'please reply here'));
+  const failure = new Error('transport connection dropped');
+  setPublishFailure(failure);
+  assert.equal(await registry.routeSpeech('agent', 'reply', 'selected'), null);
+  assert.equal(publishCalls.length, 1);
   assert.equal(failures.length, 1);
-  assert.equal(failures[0].channelId, null);
-  assert.match(failures[0].reason, /no locus/);
+  assert.equal(failures[0]!.channelId, 'selected');
+  assert.ok(failures[0]!.reason.includes(failure.message));
+  assert.equal(traces.filter(trace => trace.type === 'mcpl:speech-route-failed').length, 1);
+  assert.equal(traces.filter(trace => trace.type === 'mcpl:speech-routed').length, 0);
 });
 
 // ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──

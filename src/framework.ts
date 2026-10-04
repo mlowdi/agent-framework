@@ -109,6 +109,8 @@ import {
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
+import { projectToolResultMedia } from './tool-result-media.js';
+import { IMAGE_TOKEN_ESTIMATE, estimateImagePolicyContentTokens } from '@animalabs/membrane';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -204,25 +206,16 @@ function estimateAppendedRoundTokens(
   injections: Array<{ content: ContentBlock[] }>,
 ): number {
   let chars = 0;
-  let images = 0;
+  let imageTokens = 0;
   for (const tc of toolResults) {
     chars += spilled.get(tc.id)?.text.length ?? 0;
-    if (Array.isArray(tc.result.data)) {
-      for (const raw of tc.result.data) {
-        const b = raw as { type?: unknown };
-        if (b && typeof b === 'object' && b.type === 'image') images += 1;
-      }
+    for (const block of projectToolResultMedia(tc.result.data) ?? []) {
+      if (block.type === 'image') imageTokens += block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
     }
   }
-  for (const inj of injections) {
-    for (const block of inj.content) {
-      if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
-        chars += (block as { text: string }).text.length;
-      }
-    }
-  }
+  const injectedTokens = injections.reduce((sum, injection) => sum + estimateImagePolicyContentTokens(injection.content), 0);
   const blockCount = toolResults.length + injections.length;
-  return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
+  return Math.ceil(chars / 4) + imageTokens + injectedTokens + blockCount * 20;
 }
 
 /**
@@ -967,7 +960,7 @@ export class AgentFramework {
    * heartbeat / no-trigger turn) in startAgentStream; overwritten by the next
    * turn. Never read between turns (a given agent runs one turn at a time).
    */
-  private activeTriggerChannels: Map<string, string> = new Map();
+  private activeTriggerChannels: Map<string, string | null> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
   /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
@@ -1457,6 +1450,8 @@ export class AgentFramework {
       throw new Error('Either storePath or store must be provided');
     }
 
+    let partial: AgentFramework | undefined;
+    try {
     // Register framework states
     try {
       store.registerState({ id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
@@ -1547,6 +1542,7 @@ export class AgentFramework {
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
       new OperatorLog(operatorLogPath),
     );
+    partial = framework;
     framework.providerHoldHook = config.providerHold;
 
     // If an offline recovery process crashed after switching Chronicle but
@@ -1833,6 +1829,48 @@ export class AgentFramework {
     }
 
     return framework;
+    } catch (error) {
+      const cleanupErrors: unknown[] = [];
+      if (partial) {
+        try { await partial.cleanupFailedCreation(); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (ownsStore) {
+        try { store.close(); }
+        catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      }
+      if (cleanupErrors.length) throw new AggregateError([error, ...cleanupErrors],
+        'AgentFramework.create failed and resource cleanup also failed', { cause: error });
+      throw error;
+    }
+  }
+
+  /** Teardown before start(): no live loop/turn or restart is attempted. */
+  private async cleanupFailedCreation(): Promise<void> {
+    const errors: unknown[] = [];
+    const dispose = (operation: () => void): void => {
+      try { operation(); } catch (error) { errors.push(error); }
+    };
+    dispose(() => this.queue.close());
+    dispose(() => this.pushCoalescer?.suspend());
+    dispose(() => this.tuneOutCoordinator?.stop());
+    dispose(() => this.channelRegistry?.stopAll());
+    dispose(() => this.eventGate?.dispose());
+    dispose(() => this.livenessWatchdog?.stop());
+    for (const runner of this.codeExecutionRunners.values()) dispose(() => runner.dispose());
+    for (const record of this.backgroundScripts.values()) dispose(() => record.runner.dispose());
+    clearInterval(this.syncTimer ?? undefined);
+    clearInterval(this.maintenanceTimer ?? undefined);
+    const shutdown = await Promise.allSettled([
+      this.moduleRegistry.stopAll(),
+      ...(this.mcplServerRegistry ? [this.mcplServerRegistry.closeAll()] : []),
+    ]);
+    for (const result of shutdown) if (result.status === 'rejected') errors.push(result.reason);
+    for (const agent of this.agents.values()) dispose(() => agent.getContextManager().close());
+    this.agents.clear();
+    this.sharedSlotAgents.clear();
+    this.agentConfigs.clear();
+    if (errors.length) throw new AggregateError(errors, 'Partial framework cleanup failed');
   }
 
   /**
@@ -6334,25 +6372,32 @@ export class AgentFramework {
       viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
     });
 
-    const agent = new Agent(config, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
-    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent);
-    const restoredSettings = this.readAgentRuntimeSettings(config.name);
-    if (restoredSettings) {
-      agent.restoreRuntimeSettings(
-        this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
-      );
-    }
-    this.agents.set(config.name, agent);
-    this.agentConfigs.set(config.name, config);
+    try {
+      const agent = new Agent(config, contextManager, this.membrane);
+      this.restoreToolResultGuardSetting(agent);
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      const restoredSettings = this.readAgentRuntimeSettings(config.name);
+      if (restoredSettings) {
+        agent.restoreRuntimeSettings(
+          this.validatePersistedAgentRuntimeSettings(config.name, restoredSettings),
+        );
+      }
+      this.sharedSlotAgents.add(agent);
+      this.agents.set(config.name, agent);
+      this.agentConfigs.set(config.name, config);
 
-    // First non-ephemeral agent becomes the primary for message routing
-    if (!this.primaryAgentName) {
-      this.primaryAgentName = config.name;
-    }
+      // First non-ephemeral agent becomes the primary for message routing
+      if (!this.primaryAgentName) {
+        this.primaryAgentName = config.name;
+      }
 
-    return agent;
+      return agent;
+    } catch (error) {
+      try { contextManager.close(); } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Agent initialization and context cleanup failed', { cause: error });
+      }
+      throw error;
+    }
   }
 
   /**
@@ -6667,7 +6712,8 @@ export class AgentFramework {
           // diffs against what the agent was actually last told.
           if (
             (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
-            !shouldEndTurn && !overBudget && currentState.stream
+            !shouldEndTurn && !overBudget && currentState.stream &&
+            this.activeTriggerChannels.get(agent.name) !== null
           ) {
             // Two signals qualify an injection to move the pin (n=6 + n=7):
             //  - chat:addressed — someone explicitly spoke TO the agent
@@ -8958,6 +9004,11 @@ export class AgentFramework {
     if (!continuingTurn) {
       if (trigger?.channelId) {
         this.activeTriggerChannels.set(agent.name, trigger.channelId);
+      } else if (trigger && ['api:message', 'external-message', 'api:inference-request'].includes(trigger.reason) &&
+        ['tui', 'cli', 'headless', 'web', 'web-ui', 'api', 'system'].includes(trigger.source)) {
+        // Operator messages already have archive/connected operator surfaces.
+        // Explicit null forbids fallback to a previous external channel/home.
+        this.activeTriggerChannels.set(agent.name, null);
       } else {
         this.activeTriggerChannels.delete(agent.name);
       }
@@ -11414,9 +11465,7 @@ export class AgentFramework {
       // Retain every image the result carries BEFORE the placeholder is
       // written (issue #104): the placeholder embeds the ref, so the image
       // stays reachable by provenance after the bytes leave the wire.
-      const raw = tc.result.isError
-        ? tc.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(tc.result.data, undefined, {
+      const history = toolResultDataToHistoryString(tc.result.data, undefined, {
           imageRef: (blockIndex, image) => ledger.retain({
             toolCallId: tc.id,
             toolName: tc.name,
@@ -11425,6 +11474,9 @@ export class AgentFramework {
             mediaType: image.mimeType,
           }).ref,
         });
+      const raw = tc.result.isError
+        ? (tc.result.error ?? 'Unknown error') + (projectToolResultMedia(tc.result.data) ? '\n' + history : '')
+        : history;
       spilled.set(tc.id, await this.spillOrTruncate(raw, maxChars, `${dateLabel}-${tc.id}`));
     }
     const blocks: ContentBlock[] = toolResults.map(tc => ({
@@ -11433,7 +11485,10 @@ export class AgentFramework {
       // Persisted so XML replay can reconstruct the legacy <tool_name>
       // element byte-identically to the live injection.
       toolName: tc.name,
-      content: spilled.get(tc.id)!.text,
+      // Text spill remains bounded; media is separately blob-backed by CM,
+      // so recompiles/compression see the same typed content as live rounds.
+      content: this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id)!).content,
+      imageHistory: spilled.get(tc.id)!.text,
       isError: tc.result.isError,
     }));
     return { blocks, spilled };
@@ -11638,7 +11693,11 @@ export class AgentFramework {
      *  path so the live wire copy byte-matches what the window stored. */
     precomputed?: { text: string; filePath: string | null },
   ): MembraneToolResult {
+    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
     if (afResult.isError) {
+      if (blocks) return { toolUseId: callId, isError: true,
+        content: [{ type: 'text', text: truncateForHistory(afResult.error ?? 'Tool call failed',
+          maxChars ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS) }, ...blocks] };
       // Same spill policy as successes: reuse the history copy so a giant
       // error string stays bounded on the wire too (byte-matched).
       return {
@@ -11652,7 +11711,6 @@ export class AgentFramework {
     // blocks natively rather than JSON-stringifying them away. Anything else
     // (objects, scalars) falls through to JSON. The error path was handled
     // above, so isError is always false on these return paths.
-    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
     }
@@ -11684,50 +11742,21 @@ export class AgentFramework {
      *  notices so an image-adjacent giant text block stays recoverable. */
     spillPath: string | null = null,
   ): ToolResultContentBlock[] | null {
-    if (!Array.isArray(data)) return null;
-    let hasImage = false;
-    const blocks: ToolResultContentBlock[] = [];
-    for (const raw of data) {
-      if (!raw || typeof raw !== 'object') return null;
-      const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-      if (isInlineContradiction(b)) {
-        // RFC-005 vector 2: withhold inline data claiming bulk disposition.
-        blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
-        continue;
-      }
-      if (b.type === 'text' && typeof b.text === 'string') {
-        let text = b.text;
-        if (maxChars && text.length > maxChars) {
-          text = safeSlice(text, 0, maxChars)
-            + '\n\n[truncated — original was ' + text.length + ' chars'
-            + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
-            + ']';
-        }
-        blocks.push({ type: 'text', text });
-      } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-        hasImage = true;
-        blocks.push({
-          type: 'image',
-          source: { type: 'base64', data: b.data, mediaType: b.mimeType },
-        });
-      } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
-        // RFC-005 reference block → bounded stub. Previously this bailed the
-        // whole array to JSON, which both inlined the reference verbatim and
-        // demoted any adjacent image block to stringified base64.
-        const stub = referenceStubOrNull(b, 'from tool result');
-        if (stub === null) return null;
-        blocks.push({ type: 'text', text: stub });
-      } else {
-        return null; // unknown shape — bail to JSON path
-      }
-    }
-    return hasImage ? blocks : null;
+    const blocks = projectToolResultMedia(data);
+    if (!blocks) return null;
+    return blocks.map(block => {
+      if (block.type !== 'text' || !maxChars || block.text.length <= maxChars) return block;
+      return { type: 'text', text: safeSlice(block.text, 0, maxChars)
+        + '\n\n[truncated — original was ' + block.text.length + ' chars'
+        + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '') + ']' };
+    });
   }
 
   private toolImageLedgerFor(agentName: string): ToolImageLedger {
     let ledger = this.toolImageLedgers.get(agentName);
     if (!ledger) {
-      ledger = new ToolImageLedger();
+      const cm = this.agents.get(agentName)?.getContextManager();
+      ledger = new ToolImageLedger(cm ? { store: cm.getStore(), stateId: `framework/tool-images/${encodeURIComponent(agentName)}` } : {});
       this.toolImageLedgers.set(agentName, ledger);
     }
     return ledger;
@@ -12909,7 +12938,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ conversationId, channelId, reason, textLen }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -12924,13 +12953,18 @@ export class AgentFramework {
                 ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
                 : channelId
               : 'the channel';
-            this.addMessage(
+            const target = this.agents.get(conversationId);
+            if (!target) throw new Error(`Unknown speech conversation: ${conversationId}`);
+            const kind = channelId ? 'discord-send-failed' : 'speech-routing-error';
+            target.getContextManager().addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: `[${kind}] Your previous reply (${textLen} chars) ${channelId
+                  ? `could not be delivered to ${where}` : 'could not be routed because the caller supplied no channel selection'} `
+                  + `(${reason}). It remains in the archive. No delivery was confirmed on that channel; connected operator surfaces are independent.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              { system: true, kind, channelId: channelId ?? '', reason },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
@@ -14520,11 +14554,7 @@ export class AgentFramework {
           .map((c) => c.text!)
           .join('\n');
         const hasNonText = result.content?.some((c) => c.type !== 'text');
-        const data = result.isError
-          ? undefined
-          : hasNonText
-            ? result.content
-            : (textContent || undefined);
+        const data = hasNonText ? result.content : (textContent || undefined);
 
         this.pushEvent({
           type: 'tool-result',
@@ -14888,9 +14918,9 @@ export class AgentFramework {
       : seconds >= 60 ? `${Math.round(seconds / 60)}m`
       : `${Math.round(seconds)}s`;
 
-    // Announce in the TURN's frozen locus (best-effort; never blocks the
-    // result). The sleep tool runs mid-turn, so the pin is live — same
-    // authority as every other speech path, no live re-resolution.
+    // The frozen-locus publication must settle before endTurn can dispose a
+    // closing fork: its real delivery-failure receipt still needs that agent.
+    let publication: Promise<unknown> | undefined;
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
@@ -14902,7 +14932,7 @@ export class AgentFramework {
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = this.proseTargetPins.get(agentName);
         if (target) {
-          this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
+          publication = this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
             console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
           });
         } else {
@@ -14910,15 +14940,14 @@ export class AgentFramework {
         }
       } else {
         const locus = this.turnLocusPins.get(agentName) ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
+        publication = this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });
       }
     }
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);
-    // endTurn: the agent stops here and goes idle for the duration.
-    finish({
+    const finishSleep = () => finish({
       success: true,
       data: {
         sleepingFor: human,
@@ -14928,6 +14957,8 @@ export class AgentFramework {
       },
       endTurn: true,
     });
+    if (publication) void publication.then(finishSleep);
+    else finishSleep();
   }
 
   /**
@@ -14935,8 +14966,8 @@ export class AgentFramework {
    * workspace mount and return them as a native MCP-shaped content array
    * (`[{type:'text'…},{type:'image', data, mimeType}]`). The live-turn
    * converter (tryNativeToolResultContent → membrane tool_result image
-   * blocks) delivers the actual image to the model; history storage keeps
-   * the standard compact `[image: …]` placeholder.
+   * blocks) delivers the actual image to the model. CM archives typed media;
+   * imageHistory separately keeps compact provenance refs for this inventory.
    */
   /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
    *  origin-bound, ceiling-bounded, digest-verified host fetcher. */
@@ -15366,6 +15397,7 @@ export class AgentFramework {
                 toolUseId?: string;
                 toolName?: string;
                 content?: unknown;
+                imageHistory?: string;
               };
               if (block?.type === 'image') {
                 const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
@@ -15375,11 +15407,11 @@ export class AgentFramework {
                   mediaType: block.source?.mediaType ?? 'image/png',
                   messagesBack,
                 });
-              } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
+              } else if (block?.type === 'tool_result' && (typeof block.content === 'string' || typeof block.imageHistory === 'string')) {
                 considerToolResultImages(
                   block.toolUseId ?? 'unknown',
                   block.toolName ?? 'unknown tool',
-                  parseImagePlaceholders(block.content),
+                  parseImagePlaceholders(block.imageHistory ?? block.content as string),
                   messagesBack,
                 );
               }

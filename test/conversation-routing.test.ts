@@ -12,6 +12,11 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { WebSocketServer } from 'ws';
+import type { AddressInfo } from 'node:net';
+import { once } from 'node:events';
+import { setImmediate as nextImmediate } from 'node:timers/promises';
+import { ContextManager } from '@animalabs/context-manager';
 
 function incomingEvent(overrides: {
   channelId: string;
@@ -312,6 +317,97 @@ describe('Conversation routing', () => {
     assert.ok(framework.getAgent('conversation-slack-D3-g2'), 'rebind spawns generation 2');
 
     await framework.stop();
+  });
+
+  it('a closing fork records a delayed sleep announcement failure before disposal, including after restart', async () => {
+    const channelId = 'discord:dm:closing';
+    const storePath = join(tempDir, 'delayed-sleep.chronicle');
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    let registered!: () => void;
+    const registration = new Promise<void>(resolve => { registered = resolve; });
+    let announced!: () => void;
+    const announcement = new Promise<void>(resolve => { announced = resolve; });
+    let holdPublish = false;
+    let failPublish: (() => void) | undefined;
+    wss.on('connection', socket => socket.on('message', data => {
+      const message = JSON.parse(String(data)) as { id?: string | number; method?: string; result?: unknown };
+      const reply = (result: unknown) => socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }));
+      if (message.id === 400 && message.result) { registered(); return; }
+      switch (message.method) {
+        case 'initialize':
+          reply({ protocolVersion: '2024-11-05', serverInfo: { name: 'local-delayed-publish', version: '0.0.0' },
+            capabilities: { experimental: { mcpl: { version: '0.5', channels: {
+              register: true, lifecycle: true, incoming: true, publish: true,
+            }, featureSets: { chat: { description: 'local channel', uses: ['channels.incoming', 'channels.publish'] } } } } } });
+          break;
+        case 'featureSets/update': reply({ accepted: true }); break;
+        case 'notifications/initialized':
+          socket.send(JSON.stringify({ jsonrpc: '2.0', id: 400, method: 'channels/register', params: { channels: [
+            { id: channelId, type: 'im', label: 'closing DM', direction: 'bidirectional', initiallyOpen: true },
+          ] } }));
+          break;
+        case 'channels/publish':
+          if (holdPublish) {
+            failPublish = () => socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id,
+              error: { code: -32000, message: 'selected-channel publication refused after sleep announcement' } }));
+            announced();
+          } else reply({ delivered: true });
+          break;
+        case 'channels/open': reply({ opened: true }); break;
+        case 'channels/close': reply({ closed: true }); break;
+        case 'tools/list': reply({ tools: [] }); break;
+        default: if (message.method && message.id !== undefined) reply({});
+      }
+    }));
+    let framework: AgentFramework | undefined;
+    try {
+      if (!wss.address()) await once(wss, 'listening');
+      const port = (wss.address() as AddressInfo).port;
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'engaged' }]));
+      framework = await AgentFramework.create({ storePath, membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'test' }], modules: [],
+        conversations: { templateAgent: 'trunk', idleTtlMs: 60000 }, gate: { config: { policies: [], default: 'always' } },
+        mcplServers: [{ id: 'discord', url: `ws://127.0.0.1:${port}/mcpl`, requestTimeoutMs: 3000 }],
+        syncIntervalMs: 0, maintenanceIntervalMs: 0 });
+      await registration;
+      framework.pushEvent({ ...incomingEvent({ channelId, text: 'hello', channelType: 'im' }), serverId: 'discord' } as ProcessEvent);
+      await framework.runUntilIdle();
+      const forkName = framework.getConversationRouter()!.getBinding(channelId)!.agentName;
+      const cm = framework.getAgent(forkName)!.getContextManager();
+      forceExpiry(framework, channelId, 60000);
+      holdPublish = true;
+      membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'closure-sleep', name: 'sleep',
+        input: { seconds: 60, announce: true, message: 'closing announcement' } }], 'tool_use'));
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'sweep', metadata: {} } as ProcessEvent);
+      const closure = framework.runUntilIdle();
+      await announcement;
+      await nextImmediate();
+      assert.ok(framework.getAgent(forkName), 'endTurn cannot destroy the receipt target while publication is unsettled');
+      assert.ok(failPublish);
+      const fail = failPublish;
+      failPublish = undefined;
+      fail();
+      await closure;
+      assert.equal(framework.getAgent(forkName), null, 'the fork is disposed once the delivery outcome settles');
+      const failures = cm.getAllMessages().filter(message => message.metadata?.kind === 'discord-send-failed');
+      assert.equal(failures.length, 1, 'a genuine selected-channel failure produces exactly one archive receipt');
+      assert.equal(failures[0].metadata?.channelId, channelId);
+      assert.match(String(failures[0].metadata?.reason), /publication refused/);
+      await framework.stop();
+      framework = undefined;
+      const reopened = await ContextManager.open({
+        path: storePath, namespace: `conversations/${forkName}`, isolate: true,
+      });
+      try {
+        const durable = reopened.getAllMessages().filter(message => message.metadata?.kind === 'discord-send-failed');
+        assert.deepEqual(durable.map(message => message.metadata), failures.map(message => message.metadata));
+      } finally { reopened.close(); }
+    } finally {
+      failPublish?.();
+      await framework?.stop();
+      for (const socket of wss.clients) socket.terminate();
+      await new Promise<void>(resolve => wss.close(() => resolve()));
+    }
   });
 
   it('restart does not reuse generation names or re-seed an existing namespace', async () => {

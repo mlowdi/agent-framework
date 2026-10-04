@@ -16,6 +16,7 @@
 
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
 import { formatPreservedImageSlots, formatToolImagePlaceholder, splitPreservingImageSlots } from './tool-image-ledger.js';
+import { projectToolResultMedia } from './tool-result-media.js';
 
 export interface HistorySerializeOptions {
   /**
@@ -51,8 +52,16 @@ export function toolResultDataToHistoryString(
   maxChars?: number,
   options?: HistorySerializeOptions,
 ): string {
-  const fromArray = tryHistoryStringFromContentArray(data, options);
-  const str = fromArray ?? JSON.stringify(data);
+  const media = projectToolResultMedia(data);
+  const fromArray = media ? media.map((block, blockIndex) => {
+    if (block.type === 'text') return block.text;
+    if (block.type !== 'image') return '';
+    if (block.source.type === 'url') return '[image: URL source retained in archive]';
+    const image = { data: block.source.data, mimeType: block.source.mediaType };
+    const ref = options?.imageRef?.(blockIndex, image) ?? null;
+    return formatToolImagePlaceholder(image.mimeType, formatSize(Math.floor(image.data.length * 3 / 4)), ref);
+  }).join('\n') : tryHistoryStringFromContentArray(data, options);
+  const str = fromArray ?? JSON.stringify(data) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 

@@ -140,6 +140,8 @@ export class McplServerRegistry {
   async closeAll(): Promise<void> {
     const connections = Array.from(this.servers.values());
     this.servers.clear();
-    await Promise.all(connections.map((c) => c.close()));
+    const results = await Promise.allSettled(connections.map(async connection => connection.close()));
+    const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
+    if (errors.length) throw new AggregateError(errors, 'MCPL connection shutdown failed');
   }
 }
