@@ -18,6 +18,14 @@ export interface ModuleProcessResponse {
   response: EventResponse;
 }
 
+/** Observability-only response; media content is redacted metadata, not replayable producer blocks. */
+export interface ModuleProcessDiagnosticResponse {
+  moduleName: string;
+  response: Omit<EventResponse, 'addMessages'> & {
+    addMessages?: Array<Omit<NonNullable<EventResponse['addMessages']>[number], 'content'> & { content: unknown[] }>;
+  };
+}
+
 /**
  * Configuration for process event logging.
  */
@@ -413,8 +421,8 @@ export interface ProcessLogEntry {
   timestamp: number;
   /** The process event that was handled */
   processEvent: ProcessEvent;
-  /** Responses from all modules, or blob ID if large */
-  responses: ModuleProcessResponse[] | { blobId: string };
+  /** Redacted diagnostic responses from all modules, or blob ID if large. */
+  responses: ModuleProcessDiagnosticResponse[] | { blobId: string };
 }
 
 /**

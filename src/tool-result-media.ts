@@ -1,4 +1,4 @@
-import { normalizeImageContent, projectNativeImageContent, type ContentBlock } from '@animalabs/membrane';
+import { normalizeImageContent, projectNativeImageContent, isVisualImageContent, type ContentBlock } from '@animalabs/membrane';
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
 
 /** Project structured tool/recall data in traversal order without ever placing
@@ -33,12 +33,14 @@ export function projectToolResultMedia(data: unknown): ContentBlock[] | null {
       pending.push(referenceStubOrNull(block, 'from tool result') ?? '[reference unavailable: invalid source]');
       return;
     }
-    if (block.type === 'image' || block.type === 'input_image') {
+    if (isVisualImageContent(block) || block.type === 'input_image') {
       hasMedia = true;
       flush();
       const image = normalizeImageContent(block);
-      // Only normalized source/attachment attributes cross the model boundary.
-      if (image.type === 'image') {
+      // Generated producer metadata and native originals remain archival
+      // testimony. Formatters project the visual at their own wire boundary.
+      if (image.type === 'generated_image') blocks.push(image);
+      else if (image.type === 'image') {
         const { rawItem: _rawItem, ...visual } = image;
         blocks.push(visual);
       } else blocks.push(image);

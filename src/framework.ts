@@ -39,6 +39,7 @@ import type {
   ProcessEvent,
   EventResponse,
   ModuleProcessResponse,
+  ModuleProcessDiagnosticResponse,
   AgentSettleResult,
   ToolCall,
   ToolCallEvent,
@@ -110,7 +111,7 @@ import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 import { projectToolResultMedia } from './tool-result-media.js';
-import { IMAGE_TOKEN_ESTIMATE, estimateImagePolicyContentTokens } from '@animalabs/membrane';
+import { IMAGE_TOKEN_ESTIMATE, estimateImagePolicyContentTokens, isVisualImageContent, OPENAI_RESPONSES_ITEMS_METADATA_KEY } from '@animalabs/membrane';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -210,7 +211,7 @@ function estimateAppendedRoundTokens(
   for (const tc of toolResults) {
     chars += spilled.get(tc.id)?.text.length ?? 0;
     for (const block of projectToolResultMedia(tc.result.data) ?? []) {
-      if (block.type === 'image') imageTokens += block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
+      if (isVisualImageContent(block)) imageTokens += block.tokenEstimate ?? IMAGE_TOKEN_ESTIMATE;
     }
   }
   const injectedTokens = injections.reduce((sum, injection) => sum + estimateImagePolicyContentTokens(injection.content), 0);
@@ -962,6 +963,7 @@ export class AgentFramework {
    */
   private activeTriggerChannels: Map<string, string | null> = new Map();
   private running = false;
+  private diagnosticsSignalHandler: (() => void) | null = null;
   private loopPromise: Promise<void> | null = null;
   /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
    * `running`, which is overloaded as the runLoop condition, the maintenance
@@ -1807,8 +1809,7 @@ export class AgentFramework {
     // (journal) without a restart — for catching the wake-wedge on the running
     // process. Shows the gate's `inferring` set + buffered-event count (the
     // wedge signature), active streams, and pending inference requests.
-    try {
-      process.on('SIGUSR2', () => {
+    framework.diagnosticsSignalHandler = () => {
         try {
           const gate = framework.eventGate?.inferenceDiagnostics() ?? null;
           console.error(
@@ -1823,9 +1824,12 @@ export class AgentFramework {
         } catch (err) {
           console.error('[diagnostics] dump failed:', err instanceof Error ? err.message : err);
         }
-      });
+    };
+    try {
+      process.on('SIGUSR2', framework.diagnosticsSignalHandler);
     } catch {
       // SIGUSR2 not available on this platform — non-fatal.
+      framework.releaseDiagnosticsSignal();
     }
 
     return framework;
@@ -1845,8 +1849,15 @@ export class AgentFramework {
     }
   }
 
+  private releaseDiagnosticsSignal(): void {
+    const handler = this.diagnosticsSignalHandler;
+    this.diagnosticsSignalHandler = null;
+    if (handler) process.removeListener('SIGUSR2', handler);
+  }
+
   /** Teardown before start(): no live loop/turn or restart is attempted. */
   private async cleanupFailedCreation(): Promise<void> {
+    this.releaseDiagnosticsSignal();
     const errors: unknown[] = [];
     const dispose = (operation: () => void): void => {
       try { operation(); } catch (error) { errors.push(error); }
@@ -1911,6 +1922,7 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.releaseDiagnosticsSignal();
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -5527,8 +5539,8 @@ export class AgentFramework {
     if (query?.moduleName) {
       filtered = filtered.filter((e) => {
         if (e.summary?.responsesIsBlob) return false;
-        const responses = e.entry.responses as ModuleProcessResponse[];
-        return responses.some((r) => r.moduleName === query.moduleName);
+        const responses = e.entry.responses;
+        return Array.isArray(responses) && responses.some((r) => r.moduleName === query.moduleName);
       });
     }
 
@@ -11824,24 +11836,28 @@ export class AgentFramework {
     }
 
     const record = value as Record<string, unknown>;
-    if (record.type === 'image' && typeof record.data === 'string' && typeof record.mimeType === 'string') {
-      const clone: Record<string, unknown> = {};
-      seen.set(value, clone);
-      for (const [key, child] of Object.entries(record)) {
-        if (key === 'data' || key === 'mimeType') continue;
-        clone[key] = this.sanitizeProcessLogValue(child, seen);
-      }
-      clone.type = 'image';
-      clone.mimeType = record.mimeType;
-      clone.approxByteLength = this.approximateDecodedBase64Bytes(record.data);
-      clone.redacted = true;
-      return clone;
-    }
-
+    const source = record.source;
+    const base64Source = source && typeof source === 'object' && 'type' in source && source.type === 'base64' ? source : undefined;
+    const data = typeof record.data === 'string' ? record.data
+      : base64Source && 'data' in base64Source && typeof base64Source.data === 'string' ? base64Source.data : undefined;
+    const inlineImage = isVisualImageContent(record) && data !== undefined;
     const clone: Record<string, unknown> = {};
     seen.set(value, clone);
     for (const [key, child] of Object.entries(record)) {
+      // Provider testimony is opaque; do not inspect or stringify its payload first.
+      if (key === 'rawItem' || key === OPENAI_RESPONSES_ITEMS_METADATA_KEY) continue;
+      if (inlineImage && (key === 'data' || key === 'mimeType' || key === 'source')) continue;
       clone[key] = this.sanitizeProcessLogValue(child, seen);
+    }
+    if (inlineImage) {
+      const mime = typeof record.mimeType === 'string' ? record.mimeType
+        : base64Source && 'mediaType' in base64Source ? base64Source.mediaType
+        : base64Source && 'media_type' in base64Source ? base64Source.media_type : undefined;
+      if (typeof mime === 'string') clone.mimeType = mime;
+      clone.encodedBytes = data.length;
+      clone.approxByteLength = this.approximateDecodedBase64Bytes(data);
+      clone.metadataOnly = true;
+      clone.redacted = true;
     }
     return clone;
   }
@@ -11889,7 +11905,7 @@ export class AgentFramework {
     const entry: ProcessLogEntry = {
       timestamp: Date.now(),
       processEvent: this.sanitizeProcessLogValue(event) as ProcessEvent,
-      responses: this.sanitizeProcessLogValue(responses) as ModuleProcessResponse[],
+      responses: this.sanitizeProcessLogValue(responses) as ModuleProcessDiagnosticResponse[],
     };
 
     // Blob threshold: 10KB
@@ -12432,8 +12448,12 @@ export class AgentFramework {
       }
     }
 
+    // Process traces are diagnostic snapshots, never authoritative EventResponses.
+    // Independent log/trace views also isolate the producer from mutable observers.
+    const payload = this.traceListeners.length > 0 && (event.type === 'process:received' || event.type === 'process:completed')
+      ? this.sanitizeProcessLogValue(event) as typeof event : event;
     const traceEvent = {
-      ...event,
+      ...payload,
       timestamp: Date.now(),
     } as TraceEvent;
 

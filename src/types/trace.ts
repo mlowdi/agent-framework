@@ -1,5 +1,5 @@
 import type { ProcessEvent } from './events.js';
-import type { ModuleProcessResponse } from './framework.js';
+import type { ModuleProcessDiagnosticResponse } from './framework.js';
 import type { SessionUsage } from '../usage/types.js';
 
 /**
@@ -32,7 +32,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'process:completed';
       processEvent: ProcessEvent;
-      responses: ModuleProcessResponse[];
+      responses: ModuleProcessDiagnosticResponse[];
       durationMs: number;
     })
 
