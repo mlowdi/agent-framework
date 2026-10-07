@@ -15,6 +15,8 @@ test('agent wires immutable-prefix and exact wire receipt only for kv-unified', 
   const cm = {
     getStrategy: () => strategy,
     setToolDefinitions: () => {},
+    setSystemPrompt: () => {},
+    getLiveImagePolicy: () => undefined,
     compile: async (_budget: unknown, _injections: unknown, options: unknown) => {
       compileOptions = options;
       return {
@@ -52,6 +54,8 @@ test('agent leaves marker ownership unchanged for non-kv strategies', async () =
   const cm = {
     getStrategy: () => ({ isKvUnifiedEnabled: () => false }),
     setToolDefinitions: () => {},
+    setSystemPrompt: () => {},
+    getLiveImagePolicy: () => undefined,
     compile: async (_budget: unknown, _injections: unknown, options: unknown) => {
       compileOptions = options;
       return { messages: [], systemInjections: [] };
@@ -77,6 +81,8 @@ test('a new activation closes the receipt flight its predecessor left open befor
   const cm = {
     getStrategy: () => strategy,
     setToolDefinitions: () => {},
+    setSystemPrompt: () => {},
+    getLiveImagePolicy: () => undefined,
     compile: async () => ({
       messages: [{ participant: 'user', content: [{ type: 'text', text: 'hello' }] }],
       systemInjections: [],

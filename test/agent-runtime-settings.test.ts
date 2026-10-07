@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 
-import { AutobiographicalStrategy } from '@animalabs/context-manager';
-import { AgentFramework, BudgetPreflightError } from '../src/index.js';
+import { AutobiographicalStrategy, ContextManager, type ContextInjection, type StrategyContext } from '@animalabs/context-manager';
+import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
+import { Agent, AgentFramework, BudgetPreflightError } from '../src/index.js';
 
 const membrane = {} as any;
 
@@ -20,6 +21,59 @@ function strategy(): AutobiographicalStrategy {
 }
 
 describe('agent runtime settings', () => {
+it('native memory ground initializes before activation, follows composed real activation, and ignores pure preview', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-memory-ground-'));
+  const ground = 'Disposable full carrier ground.';
+  const frame = 'Disposable exact parent framing.';
+  const requests: NormalizedRequest[] = [];
+  const nativeMembrane = {
+    complete: async (request: NormalizedRequest) => {
+      requests.push(structuredClone(request));
+      return { content: [{ type: 'text', text: 'Disposable native structural output, not real recollection.' }], stopReason: 'end_turn', usage: { inputTokens: 100, outputTokens: 20 } };
+    },
+    streamYielding: () => ({}) as never,
+  } as unknown as Membrane;
+  const nativeToolStates: unknown[] = [];
+  class MemoryGroundStrategy extends AutobiographicalStrategy {
+    override async tick(ctx: StrategyContext): Promise<void> { nativeToolStates.push(ctx.tools); await super.tick(ctx); }
+  }
+  const cm = await ContextManager.open({ path: join(dir, 'store'), namespace: 'agents/liv', membrane: nativeMembrane, strategy: new MemoryGroundStrategy({
+    compressionModel: 'gpt-6.1-sol', targetChunkTokens: 24_000, headWindowTokens: 512, recentWindowTokens: 150_000,
+    summaryTargetTokens: 1536, compressionMaxTokens: 8192, mergeThreshold: 4, l1HoldbackChunks: 0, adaptiveResolution: true,
+    foldingStrategy: 'kv-stable', identityReminder: frame, autoTickOnNewMessage: false, logEffectiveConfig: false,
+  }) });
+  const agent = new Agent({ name: 'liv', model: 'gpt-6.1-sol', systemPrompt: ground, contextBudgetTokens: 604608 }, cm, nativeMembrane);
+  const injection = (value: string): ContextInjection[] => [{ namespace: 'disposable-ground-proof', position: 'system', content: [{ type: 'text', text: value }] }];
+  const tools = [{ name: 'fixture_tool', description: 'Inert, never executed.', inputSchema: { type: 'object' as const } }];
+  const installedTools: unknown[] = [];
+  const installTools = cm.setToolDefinitions.bind(cm);
+  cm.setToolDefinitions = value => { installedTools.push(value); installTools(value); };
+  try {
+    const preview = await agent.buildActivationRequest(tools, injection('PREVIEW-ONLY SYSTEM DATA'));
+    assert.equal(preview.system, `${ground}\nPREVIEW-ONLY SYSTEM DATA`); assert.equal(requests.length, 0);
+    const first = cm.addMessage('user', [{ type: 'text', text: 'Disposable preactivation historical observation.' }]);
+    cm.finalizeArchivalBatch(first); await cm.tick();
+    assert.equal(requests[0].system, ground, 'constructor initializes native ground; preview cannot replace it');
+    assert.deepEqual(installedTools, [], 'preview never calls the live tool setter');
+    assert.equal(nativeToolStates[0], undefined, 'preview never installs live CM tools');
+    const activation = await agent.startStreamWithInjections(tools, injection('REAL ACTIVATION SYSTEM DATA'));
+    assert.equal(activation.request.system, `${ground}\nREAL ACTIVATION SYSTEM DATA`);
+    assert.deepEqual(installedTools, [tools], 'actual activation installs its live tools exactly once');
+    assert.ok(!JSON.stringify(activation.request).includes(frame), 'deliberate memory framing never governs the ordinary primary request');
+    const second = cm.addMessage('liv', [{ type: 'text', text: 'Disposable postactivation historical observation.' }]);
+    cm.finalizeArchivalBatch(second); await cm.tick();
+    assert.equal(requests[1].system, activation.request.system, 'real activation refreshes the composed native ground');
+    assert.deepEqual(nativeToolStates[1], tools, 'actual activation updates the live strategy context');
+    await agent.buildActivationRequest([{ ...tools[0], name: 'preview_only_tool' }], injection('LATER PREVIEW ONLY'));
+    assert.deepEqual(installedTools, [tools], 'later preview cannot replace an actual tool surface');
+    await cm.resetHeadWindow();
+    assert.equal(requests.length, 3); assert.equal(requests[2].system, activation.request.system, 'auxiliary memory retains actual activation, not preview');
+    for (const request of requests) {
+      assert.equal(request.config.model, 'gpt-6.1-sol'); assert.equal(request.tools, undefined);
+      assert.ok(request.messages.some(message => message.content.some(block => block.type === 'text' && block.text.includes(frame))));
+    }
+  } finally { agent.reset(); cm.close(); rmSync(dir, { recursive: true, force: true }); }
+});
 it('agent_settings is one typed tool for the hot runtime surface', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'agent-settings-'));
   const framework = await AgentFramework.create({
@@ -307,9 +361,10 @@ function stubPreview(
   agentName: string,
   impl: ((budget: { maxTokens: number }) => Record<string, unknown>) | undefined,
 ): void {
-  const cm = framework.getAgent(agentName)!.getContextManager() as unknown as {
-    previewContext?: (budget: { maxTokens: number }) => unknown;
-  };
+  // Test-only access to the framework-created manager; Agent exposes no getter.
+  const manager = Reflect.get(framework.getAgent(agentName)!, 'contextManager');
+  assert.ok(manager instanceof ContextManager);
+  const cm = manager as unknown as { previewContext?: (budget: { maxTokens: number }) => unknown };
   if (impl === undefined) {
     cm.previewContext = undefined;
   } else {

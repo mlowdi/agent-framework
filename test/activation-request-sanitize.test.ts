@@ -15,6 +15,8 @@ import type { Membrane } from '@animalabs/membrane';
 /** buildActivationRequest only needs compile(); membrane is never touched. */
 function agentCompiling(messages: unknown[]): Agent {
   const cm = {
+    setSystemPrompt: () => {},
+    getLiveImagePolicy: () => undefined,
     compile: async () => ({ messages, systemInjections: [] }),
   } as unknown as ContextManager;
   return new Agent(

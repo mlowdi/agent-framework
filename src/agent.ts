@@ -159,6 +159,7 @@ export class Agent {
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
+    this.contextManager.setSystemPrompt(this.systemPrompt);
     this.membrane = membrane;
     const hot = this.getHotContextSettings();
     this.configuredTailTokens = hot?.tailTokens;
@@ -779,16 +780,7 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget
-  ): Promise<NormalizedRequest> {
-    // Keep the context manager's view of the live tool surface current: the
-    // autobiographical strategy must declare the same tools on its
-    // summarizer/compression requests, or transcripts containing tool blocks
-    // are refused by Anthropic's reasoning_extraction classifier (labclaude
-    // incident, 2026-07-09). Optional chaining: older context-manager
-    // versions don't have the hook.
-    (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
-      .setToolDefinitions?.(availableTools);
-
+  ): Promise<NormalizedRequest & { system: string }> {
     const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
       beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
@@ -904,7 +896,11 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
+    // Live memory follows the actual activation surface; pure previews must
+    // neither install tools nor replace the resident's native ground.
+    this.contextManager.setToolDefinitions?.(availableTools);
     const request = await this.buildActivationRequest(availableTools, injections, budget);
+    this.contextManager.setSystemPrompt(request.system);
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })

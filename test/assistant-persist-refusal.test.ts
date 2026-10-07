@@ -16,6 +16,7 @@ import type { Membrane } from '@animalabs/membrane';
 
 function agentRecording(stored: Array<{ participant: string; content: unknown[] }>): Agent {
   const cm = {
+    setSystemPrompt: () => {},
     addMessage: (participant: string, content: unknown[]) => {
       stored.push({ participant, content });
       return 'id';

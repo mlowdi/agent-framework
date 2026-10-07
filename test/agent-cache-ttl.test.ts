@@ -7,6 +7,8 @@ import type { Membrane } from '@animalabs/membrane';
 
 /** buildActivationRequest only needs compile(); membrane is never touched. */
 const stubContextManager = {
+  setSystemPrompt: () => {},
+  getLiveImagePolicy: () => undefined,
   compile: async () => ({ messages: [], systemInjections: [] }),
 } as unknown as ContextManager;
 
